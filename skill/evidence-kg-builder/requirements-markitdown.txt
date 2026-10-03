@@ -1,0 +1,3 @@
+# Optional reading-view parser. Default requirements and parser stay unchanged.
+-r requirements.txt
+markitdown[pdf,docx,pptx,xlsx]==0.1.8

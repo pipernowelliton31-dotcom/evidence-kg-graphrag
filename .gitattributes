@@ -1,0 +1,4 @@
+# Preserve source bytes: the engine signature hashes raw script contents.
+* -text whitespace=cr-at-eol
+# Markdown uses two trailing spaces for explicit line breaks.
+*.md whitespace=-blank-at-eol,cr-at-eol

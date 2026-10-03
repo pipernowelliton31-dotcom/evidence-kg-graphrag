@@ -1,0 +1,4 @@
+-r skill/evidence-kg-builder/requirements.txt
+pandas>=2.2,<4
+jupyterlab>=4,<5
+ipywidgets>=8,<9

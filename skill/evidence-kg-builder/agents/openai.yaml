@@ -1,0 +1,3 @@
+interface:
+  display_name: "Evidence KG + Lean GraphRAG"
+  short_description: "Build sparse enterprise KGs and query them with lightweight multi-channel GraphRAG"

@@ -1,0 +1,29 @@
+{
+  "root": "../materials",
+  "files": [
+    {
+      "path": "测试集A_产品架构图.png",
+      "role": "corpus"
+    },
+    {
+      "path": "测试集A_产品规格与定价文档.pdf",
+      "role": "corpus"
+    },
+    {
+      "path": "测试集A_产品运营分析报告.pptx",
+      "role": "corpus"
+    },
+    {
+      "path": "测试集A_分析问题集.docx",
+      "role": "questions"
+    },
+    {
+      "path": "测试集A_工作室运营手册.docx",
+      "role": "corpus"
+    },
+    {
+      "path": "测试集A_运营数据记录.xlsx",
+      "role": "corpus"
+    }
+  ]
+}

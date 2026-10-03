@@ -1,0 +1,8 @@
+# Lightweight runtime: no MarkItDown, OCR, local embeddings, vector DB, or graph DB.
+defusedxml==0.7.1
+openpyxl==3.1.5
+python-pptx==1.0.2
+pdfplumber==0.11.10
+Pillow==12.3.0
+requests==2.34.2
+python-dotenv==1.2.4

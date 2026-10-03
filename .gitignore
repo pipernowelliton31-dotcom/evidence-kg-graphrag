@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+runs/
+kg_debug_run/
+skill.zip
+~$*
+*.log
+.DS_Store
+Thumbs.db
