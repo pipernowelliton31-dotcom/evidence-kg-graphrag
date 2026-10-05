@@ -9,11 +9,13 @@ import subprocess
 import symtable
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pandas as pd  # Import before mocking notebook subprocess calls on Windows.
+import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / 'evidence_kg_openrouter_debug.ipynb'
@@ -165,6 +167,64 @@ class NotebookExecutionTests(unittest.TestCase):
         metrics = json.loads((self.run / 'openrouter_metrics.json').read_text(encoding='utf-8'))
         self.assertEqual(len(metrics), len(ns['QUESTIONS']))
         self.assertEqual(ns['RAG_WORK_DIR'], self.native)
+
+    def choice_response(self, content, finish_reason):
+        response = Mock()
+        response.json.return_value = {
+            'choices': [{'message': {'content': content}, 'finish_reason': finish_reason}],
+            'usage': {'prompt_tokens': 5, 'completion_tokens': 5, 'total_tokens': 10}}
+        return response
+
+    def qa_namespace(self):
+        """Load Cell 21 without its Cell 20 prerequisite gate."""
+        ns = dict(self.overrides())
+        ns.update({'MODEL': 'test/model', 'QA_MAX_TOKENS': 4096, 'QA_REASONING': 'medium',
+                   'MAX_NETWORK_RETRIES': 2, 'HTTP_TIMEOUT': 300,
+                   'OPENROUTER_BASE_URL': 'https://example.invalid/api/v1',
+                   'ANSWER_PROMPT': 'answer', 'call_logs': [], 'time': time,
+                   'requests': requests, 'json': json})
+        code = self.code(21)
+        code = code.replace("if 'QUESTION' not in globals() or 'retrieval' not in globals():", 'if False:')
+        code = code.replace("    raise RuntimeError('请先运行 Cell 20，得到同一问题的检索上下文，再运行 Cell 21。')", '    pass')
+        ns['QUESTION'] = 'test'
+        ns['retrieval'] = {'context': 'ctx', 'query_plan': {'intent': 'factual'}, 'stats': {}}
+        exec(compile(code, 'cell21', 'exec'), ns)
+        return ns
+
+    def test_empty_model_answer_is_retried_and_then_reported(self):
+        """A None content must not be handed downstream as a blank answer."""
+        qa_ns = self.qa_namespace()
+        responses = [self.choice_response(None, 'stop'), self.choice_response('重试后的答案', 'stop')]
+        with patch('requests.post', side_effect=responses) as post:
+            with patch('time.sleep'):
+                answer, _usage, _elapsed = qa_ns['call_final_answer']('q', qa_ns['retrieval'])
+        self.assertEqual(answer, '重试后的答案')
+        self.assertEqual(post.call_count, 2)
+
+    def test_exhausted_retries_raise_instead_of_returning_blank(self):
+        qa_ns = self.qa_namespace()
+        with patch('requests.post', return_value=self.choice_response('', 'length')):
+            with patch('time.sleep'):
+                with self.assertRaisesRegex(Exception, 'length|max_tokens'):
+                    qa_ns['call_final_answer']('q', qa_ns['retrieval'])
+
+    def test_concurrent_batch_reports_per_question_failure_without_aborting(self):
+        ns = dict(self.overrides())
+        original = self.post.side_effect
+
+        def flaky(*args, **kwargs):
+            text = kwargs['json']['messages'][1]['content']
+            if isinstance(text, str) and text.startswith('QUESTION\nExcel'):
+                return self.choice_response(None, 'stop')
+            return original(*args, **kwargs)
+
+        with patch('requests.post', side_effect=flaky):
+            with patch('time.sleep'):
+                exec(compile(self.code(22), 'cell22', 'exec'), ns)
+        self.assertEqual(len(ns['multi_results']), len(ns['QUESTIONS']))
+        failed = [r for r in ns['multi_results'] if r.get('error')]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]['index'], 5)
 
     def test_single_answer_without_retrieval_reports_prerequisite(self):
         with self.assertRaisesRegex(RuntimeError, 'Cell 20'):
