@@ -3,11 +3,13 @@ import json
 import sys
 import tempfile
 import unittest
+import shutil
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from interactive_kg import InteractiveKGSession
+from interactive_kg import InteractiveKGSession, notebook_runtime
 
 
 class InteractiveKGTests(unittest.TestCase):
@@ -113,6 +115,51 @@ class InteractiveKGTests(unittest.TestCase):
             self.session.ask("价格是多少？")
         self.assertEqual(self.cli_calls, [])
         self.assertFalse(Path(self.session.runtime["WORK_DIR"]).exists())
+
+    def test_model_helpers_work_with_missing_optional_config_limits(self):
+        ns = self.session.runtime
+        Path(ns['MODEL_OUTPUT_DIR']).mkdir(parents=True)
+        response = Mock()
+        response.json.return_value = {'choices': [{'message': {'content': '{"tasks":[{"task_id":"u1"}]}'}}],
+                                      'usage': {'total_tokens': 1}}
+        with patch.object(ns['requests'], 'post', return_value=response) as post:
+            # Load the real helpers; setUp substitutes network-free stage functions.
+            real = notebook_runtime(ROOT / 'evidence_kg_openrouter_debug.ipynb', ns)
+            real['call_openrouter_batch']('extract', {'batch_index': 0, 'tasks': [{'task_id': 'u1'}]}, 'fp')
+            self.assertEqual(post.call_args.kwargs['json']['max_tokens'], 10000)
+            real['call_openrouter_batch']('align', {'batch_index': 0, 'tasks': [{'task_id': 'u1'}]}, 'fp', 1)
+            self.assertEqual(post.call_args.kwargs['json']['max_tokens'], 3000)
+            response.json.return_value = {'choices': [{'message': {'content': 'Answer'}}], 'usage': {}}
+            real['call_final_answer']('question', {'context': 'Source context'})
+            self.assertEqual(post.call_args.kwargs['json']['max_tokens'], 4096)
+            self.assertEqual(post.call_args.kwargs['timeout'], (30, 300))
+
+    def test_explicit_graph_reuses_snapshot_without_state_validation_or_build(self):
+        work = self.root / 'existing'
+        shutil.copytree(ROOT / 'examples/prebuilt/work', work)
+        (work / 'state.json').write_text('{"engine_signature":"older_engine"}', encoding='utf-8')
+        before = {p.name: p.read_bytes() for p in work.iterdir() if p.is_file()}
+        session = InteractiveKGSession(ROOT / 'evidence_kg_openrouter_debug.ipynb',
+                                       {'OPENROUTER_API_KEY': 'test-key'},
+                                       progress=self.messages.append, graph_work_dir=work)
+        session.runtime['run_cli'] = Mock(side_effect=AssertionError('Must not run pipeline'))
+        session.runtime['call_final_answer'] = Mock(return_value=('Answer', {}, 0.01))
+        result = session.ask('What is in the existing knowledge graph?')
+        self.assertEqual(result['answer'], 'Answer')
+        session.runtime['run_cli'].assert_not_called()
+        self.assertEqual(before, {p.name: p.read_bytes() for p in work.iterdir() if p.is_file()})
+
+    def test_explicit_missing_graph_never_starts_build(self):
+        work = self.root / 'not-built'
+        session = InteractiveKGSession(ROOT / 'evidence_kg_openrouter_debug.ipynb',
+                                       {'OPENROUTER_API_KEY': 'test-key'}, graph_work_dir=work)
+        session.runtime['run_cli'] = Mock(side_effect=AssertionError('Must not run pipeline'))
+        session.runtime['call_final_answer'] = Mock(side_effect=AssertionError('Must not call model'))
+        with self.assertRaisesRegex(FileNotFoundError, '04_knowledge_graph.json'):
+            session.ask('ExampleProduct 的价格是多少？')
+        self.assertFalse(work.exists())
+        session.runtime['run_cli'].assert_not_called()
+        session.runtime['call_final_answer'].assert_not_called()
 
 
 if __name__ == "__main__":

@@ -83,8 +83,9 @@ def _looks_like_version_label(value):
 def _supported_inline_business_codes(labels, evidence_text):
     """Extract generic evidence-backed business codes without assuming benchmark prefixes.
 
-    Accept only mixed letter/digit tokens that are either parenthesized in a name/alias or explicitly
-    introduced by an ID/code cue in evidence. Pure version labels are excluded.
+    A code must belong to the mention's own name/aliases, not merely occur somewhere in its
+    evidence unit. Document, review and change-record codes are not IDs of every entity on a page.
+    Explicit identifier fields supplied by the extractor are handled separately.
     """
     labels = [unicodedata.normalize("NFKC", str(x)) for x in labels if str(x).strip()]
     evidence = unicodedata.normalize("NFKC", str(evidence_text))
@@ -95,14 +96,18 @@ def _supported_inline_business_codes(labels, evidence_text):
             candidates.add(m.group(1))
     cue_re = r"(?:编号|编码|代码|标识|ID|identifier|code)\s*[:：=#]?\s*(" + token_re + r")"
     for m in re.finditer(cue_re, evidence, flags=re.I):
-        candidates.add(m.group(1))
+        code = m.group(1)
+        boundary = r"(?<![A-Za-z0-9._/-])" + re.escape(code) + r"(?![A-Za-z0-9._/-])"
+        if any(re.search(boundary, label, flags=re.I) for label in labels):
+            candidates.add(code)
     result = set()
     for code in candidates:
         if _looks_like_version_label(code):
             continue
         if not (re.search(r"[A-Za-z]", code) and re.search(r"\d", code)):
             continue
-        if norm(code) in norm(evidence):
+        boundary = r"(?<![A-Za-z0-9._/-])" + re.escape(code) + r"(?![A-Za-z0-9._/-])"
+        if re.search(boundary, evidence, flags=re.I):
             result.add(code)
     return result
 
@@ -1055,17 +1060,27 @@ def all_relations(state):
 def _repair_identity_metadata(state):
     """Backfill deterministic alias declarations and inline business IDs from accepted evidence."""
     changed = []
+    units = {u["unit_id"]: u for u in state.get("units", [])}
+    inline_scopes = {norm(f"inline_{typ.casefold()}_code") for typ in TYPES}
     for m in mentions(state).values():
         evidence_text = "\n".join(e.get("quote", "") for e in m.get("evidence", []))
         if m.get("aliases") and not m.get("alias_declared") and all(norm(x) in norm(evidence_text) for x in [m["name"], *m["aliases"]]):
             m["alias_declared"] = True
             changed.append({"mention_id": m["mention_id"], "field": "alias_declared"})
-        if m["type"] not in ALIGNABLE_TYPES:
-            continue
         scope = f"inline_{m['type'].casefold()}_code"
-        existing = {(norm(i["scope"]), norm(i["value"])) for i in m.get("identifiers", [])}
         labels = [m["name"], *m.get("aliases", [])]
-        codes = _supported_inline_business_codes(labels, evidence_text)
+        code_evidence = evidence_text or units.get(m.get("unit_id"), {}).get("content_md", "")
+        codes = _supported_inline_business_codes(labels, code_evidence)
+        supported = {norm(code) for code in codes}
+        retained = []
+        for item in m.get("identifiers", []):
+            if norm(item["scope"]) in inline_scopes and norm(item["value"]) not in supported:
+                changed.append({"mention_id": m["mention_id"], "field": "identifier",
+                                "action": "remove_unowned_inline_code", "value": item["value"]})
+            else:
+                retained.append(item)
+        m["identifiers"] = retained
+        existing = {(norm(i["scope"]), norm(i["value"])) for i in retained}
         for code in sorted(codes):
             if (norm(scope), norm(code)) in existing:
                 continue

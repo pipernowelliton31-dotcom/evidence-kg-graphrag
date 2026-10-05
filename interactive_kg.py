@@ -19,6 +19,11 @@ from pathlib import Path
 SUPPORTED = {".pdf", ".docx", ".xlsx", ".pptx", ".png", ".jpg", ".jpeg", ".webp", ".md", ".txt"}
 HELPERS = {"run_cli", "_extract_json_object", "_data_url", "_batch_content",
            "call_openrouter_batch", "call_final_answer"}
+MODEL_DEFAULTS = {
+    "EXTRACT_MAX_TOKENS": 10000, "ALIGN_MAX_TOKENS": 3000, "QA_MAX_TOKENS": 4096,
+    "HTTP_TIMEOUT": 300, "MAX_NETWORK_RETRIES": 2,
+    "RAW_PREVIEW_CHARS": 5000, "CONTEXT_PREVIEW_CHARS": 8000,
+}
 
 
 def notebook_runtime(notebook_path, overrides=None):
@@ -28,7 +33,7 @@ def notebook_runtime(notebook_path, overrides=None):
     notebook_path = Path(notebook_path).resolve()
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     code = ["".join(c["source"]) for c in notebook["cells"] if c["cell_type"] == "code"]
-    namespace = {"Path": Path, "json": json, "sys": sys, "os": os, "subprocess": subprocess,
+    namespace = {**MODEL_DEFAULTS, "Path": Path, "json": json, "sys": sys, "os": os, "subprocess": subprocess,
                  "time": time, "requests": requests, "base64": base64, "mimetypes": mimetypes,
                  "re": re, "shlex": importlib.import_module("shlex")}
     config = ast.parse(next(c for c in code if "SKILL_ZIP =" in c))
@@ -47,13 +52,14 @@ def notebook_runtime(notebook_path, overrides=None):
     anchored_config = AnchorPaths().visit(ast.Module(body=assignments, type_ignores=[]))
     exec(compile(ast.fix_missing_locations(anchored_config), str(notebook_path), "exec"), namespace)
     override_names = {t.id for n in assignments for t in n.targets if isinstance(t, ast.Name)}
+    override_names |= MODEL_DEFAULTS.keys()
     override_names |= {"SKILL_DIR", "SCRIPTS_DIR", "OPENROUTER_API_KEY", "call_logs", "ROLE_OVERRIDES"}
     namespace.update({k: v for k, v in (overrides or {}).items() if k in override_names})
     namespace.setdefault("ROLE_OVERRIDES", {})
     namespace["ROLE_OVERRIDES"] = dict(namespace["ROLE_OVERRIDES"])
     namespace["ROLE_OVERRIDES"].setdefault("测试集A_分析问题集.docx", "questions")
     namespace.setdefault("call_logs", [])
-    namespace.setdefault("OPENROUTER_API_KEY", os.environ.get("OPENROUTER_API_KEY", ""))
+    namespace["OPENROUTER_API_KEY"] = namespace.get("OPENROUTER_API_KEY") or os.environ.get("OPENROUTER_API_KEY", "")
 
     source = Path(namespace.get("SKILL_DIR", namespace["SKILL_SRC"]))
     if not source.exists() and Path(namespace["SKILL_ZIP"]).is_file():
@@ -85,15 +91,104 @@ def notebook_runtime(notebook_path, overrides=None):
     script_path = str(namespace["SCRIPTS_DIR"])
     if script_path not in sys.path:
         sys.path.insert(0, script_path)
-    rag_module = importlib.import_module("lean_graphrag")
+    rag_module = importlib.reload(importlib.import_module("lean_graphrag"))
     namespace["ANSWER_PROMPT"] = rag_module.ANSWER_PROMPT
     namespace["LeanGraphRAG"] = rag_module.LeanGraphRAG
     return namespace
 
 
+def query_runtime(notebook_path, overrides=None):
+    """Prepare a query cell without executing installation or graph-building cells."""
+    settings = dict(overrides or {})
+    settings.pop('RAG_WORK_DIR', None)  # A previous query's resolved path must not pin selection.
+    settings.setdefault("call_logs", [])
+    previous_chat = settings.get("KG_CHAT")
+    if not settings.get("OPENROUTER_API_KEY") and previous_chat is not None:
+        settings["OPENROUTER_API_KEY"] = previous_chat.runtime.get("OPENROUTER_API_KEY", "")
+    namespace = notebook_runtime(notebook_path, settings)
+    selected = select_query_graph(namespace['RAG_SEARCH_ROOT'], namespace['RAG_FALLBACK_DIR'],
+                                  parser_backend=namespace.get('PARSER_BACKEND', 'native'))
+    namespace['RAG_WORK_DIR'] = selected['work_dir']
+    namespace['RAG_GRAPH_SELECTION'] = selected
+    return namespace
+
+
+def _validate_query_graph(work):
+    """Validate query artifacts without executing or requiring a current build engine."""
+    work = Path(work).resolve()
+    for name in ('04_knowledge_graph.json', '00_document_units.json'):
+        if not (work / name).is_file():
+            raise FileNotFoundError(f'已有图谱缺少 {name}：{work}；本入口不会自动重建。')
+    graph = json.loads((work / '04_knowledge_graph.json').read_text(encoding='utf-8-sig'))
+    parsed = json.loads((work / '00_document_units.json').read_text(encoding='utf-8-sig'))
+    fingerprint = graph.get('diagnostics', {}).get('fingerprint')
+    if not graph.get('diagnostics', {}).get('workflow_complete'):
+        raise RuntimeError('图谱未完成构建')
+    if not fingerprint or parsed.get('fingerprint') != fingerprint:
+        raise RuntimeError('图谱与解析单元的 fingerprint 不一致')
+    facts_path = work / '03_canonical_facts.json'
+    if facts_path.is_file():
+        facts = json.loads(facts_path.read_text(encoding='utf-8-sig'))
+        if facts.get('fingerprint') != fingerprint:
+            raise RuntimeError('图谱与事实库的 fingerprint 不一致')
+    excluded = {d['document_id'] for d in parsed['documents'] if d.get('role') != 'corpus'}
+    if any(u['document_id'] in excluded for u in parsed['units']):
+        raise RuntimeError('解析单元包含问题集或参考材料')
+    try:
+        from kg_core import validate_graph
+    except ImportError:
+        sys.path.insert(0, str(Path(__file__).resolve().parent / 'skill/evidence-kg-builder/scripts'))
+        from kg_core import validate_graph
+    report = validate_graph(graph)
+    if not report['valid']:
+        raise RuntimeError(f"已有图谱结构校验失败：{report['errors']}")
+    state_path = work / 'state.json'
+    state = json.loads(state_path.read_text(encoding='utf-8-sig')) if state_path.is_file() else {}
+    if state.get('fingerprint') and state['fingerprint'] != fingerprint:
+        raise RuntimeError('图谱与构图 checkpoint 的 fingerprint 不一致')
+    return {'backend': state.get('config', {}).get('parser_backend', 'native'),
+            'fingerprint': fingerprint, 'nodes': len(graph.get('nodes', [])),
+            'facts': len(graph.get('facts', []))}
+
+
+def select_query_graph(search_root, fallback_dir, *, parser_backend='native'):
+    """Choose the newest complete graph for the backend, then the original native snapshot."""
+    search_root, fallback = Path(search_root).resolve(), Path(fallback_dir).resolve()
+    excluded_dirs = {'archive', '.git', '.venv', 'venv', '__pycache__', 'node_modules'}
+    candidates = []
+    for directory, folders, files in os.walk(search_root, followlinks=False):
+        folders[:] = [name for name in folders if name.casefold() not in excluded_dirs]
+        work = Path(directory).resolve()
+        if work == fallback:
+            folders[:] = []
+            continue
+        if '04_knowledge_graph.json' in files:
+            candidates.append(work)
+    candidates.sort(key=lambda work: (-(work / '04_knowledge_graph.json').stat().st_mtime_ns, str(work)))
+    skipped = []
+    for work in candidates:
+        try:
+            metadata = _validate_query_graph(work)
+            if metadata['backend'] != parser_backend:
+                continue
+            return {'work_dir': work, 'source': 'latest', **metadata, 'skipped': skipped}
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+            skipped.append({'work_dir': str(work), 'reason': str(exc)})
+    try:
+        metadata = _validate_query_graph(fallback)
+        if metadata['backend'] != 'native':
+            raise RuntimeError('fallback 必须是之前的 native 图谱')
+        return {'work_dir': fallback, 'source': 'fallback', **metadata, 'skipped': skipped}
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+        raise FileNotFoundError(f'没有可用的完整图谱，native fallback 也不可用：{fallback}；{exc}') from exc
+
+
 class InteractiveKGSession:
-    def __init__(self, notebook_path, overrides=None, progress=None):
+    def __init__(self, notebook_path, overrides=None, progress=None, *, graph_work_dir=None):
         self.runtime = notebook_runtime(notebook_path, overrides)
+        self.graph_work_dir = Path(graph_work_dir).resolve() if graph_work_dir is not None else None
+        if self.graph_work_dir is not None:
+            self.runtime["WORK_DIR"] = self.graph_work_dir
         self.progress = progress or (lambda message: print(message, flush=True))
         self.history = []
         self.last_result = None
@@ -214,6 +309,10 @@ class InteractiveKGSession:
     def ensure_graph(self):
         ns = self.runtime
         self.progress("[检查] 检查已有知识图谱是否完整、可用…")
+        if self.graph_work_dir is not None:
+            self._check_existing_graph()
+            self.progress(f"[检查] 使用已有图谱：{self.graph_work_dir}；跳过全部构图阶段。")
+            return
         if self._graph_ready():
             self.progress("[检查] 已有完整知识图谱，跳过 Parse / Extraction / Alignment / Build。")
             return
@@ -246,6 +345,10 @@ class InteractiveKGSession:
             raise RuntimeError(f"图谱未通过完整性检查：{report.get('errors')}")
         self.progress("[构图] 已完成并通过完整性检查。")
 
+    def _check_existing_graph(self):
+        """Validate query artifacts without requiring a current build checkpoint."""
+        _validate_query_graph(self.graph_work_dir)
+
     def ask(self, question, api_key=None):
         question = str(question or "").strip()
         if not question:
@@ -260,7 +363,14 @@ class InteractiveKGSession:
         rag = self.runtime["LeanGraphRAG"](self.runtime["WORK_DIR"], max_hops=3,
                                            beam_width=20, context_chars=18_000)
         retrieved = rag.retrieve(question)
-        self.progress(f"[GraphRAG] facts={len(retrieved.get('fact_hits', []))} "
+        stats = retrieved['stats']
+        self.progress(f"[GraphRAG] mode={stats.get('retrieval_mode', 'ranked')} "
+                      f"structured={stats.get('structured', 0)} "
+                      f"scope={stats.get('structured_scope_matches', 0)} "
+                      f"augmentation={stats.get('structured_selected_for_augmentation', 0)} "
+                      f"table_units={stats.get('table_units', 0)} table_columns={stats.get('table_columns', 0)} "
+                      f"table_rows={stats.get('table_context_rows', 0)}/{stats.get('table_rows', 0)} "
+                      f"facts={len(retrieved.get('fact_hits', []))} "
                       f"paths={len(retrieved.get('paths', []))} raw_units={len(retrieved.get('raw_units', []))} "
                       f"context_chars={len(retrieved['context'])}")
         self.progress(f"[回答] 正在调用 {self.runtime['MODEL']}，依据召回证据生成答案…")
@@ -301,7 +411,9 @@ def display_chat(session):
                     print(f"执行失败：{exc}", flush=True)
         return None
 
-    question = widgets.Textarea(placeholder="在这里输入问题；首次提问会按需构图。",
+    placeholder = ("在这里输入问题；直接查询已有图谱，不会重新构图。" if session.graph_work_dir is not None
+                   else "在这里输入问题；首次提问会按需构图。")
+    question = widgets.Textarea(placeholder=placeholder,
                                 layout=widgets.Layout(width="100%", height="120px"))
     key = widgets.Password(description="API Key", placeholder="已有内核 Key 时可留空",
                            layout=widgets.Layout(width="100%"))

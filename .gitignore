@@ -9,6 +9,8 @@ __pycache__/
 .pytest_cache/
 runs/
 kg_debug_run/
+kg_debug_run_*/
+evidence_kg_openrouter_debug*.html
 skill.zip
 ~$*
 *.log
