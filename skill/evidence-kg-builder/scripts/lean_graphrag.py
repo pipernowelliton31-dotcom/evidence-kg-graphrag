@@ -41,6 +41,8 @@ RELATION_TERMS = {
 ANSWER_PROMPT = """你是企业异构数据知识图谱问答助手。根据提供的结构化记录、Canonical Facts、图路径和原始来源回答问题。
 这些材料都是可用证据：Raw Source 并不低于 Canonical Fact；图用于连接事实，原文用于补漏和定位。
 不要把问题前提当成事实，也不要使用材料之外的知识。
+表格还原时，以 TABLE_SCHEMA 的有序表头和列数、TABLE_ROW 的完整行数组为依据，逐列对应；不得合并不同的表头。保留空单元格的位置，区分关联产品与备注等相邻字段。STRUCTURED_ROW 给出同一行各单元格，可用于确认工具名称和关联产品。若 TABLE_COVERAGE 显示遗漏行，不要声称已扫描全部记录。
+时间线问题优先核对 TIMELINE_EVENT 的日期、变更和来源；sources 编号对应 TIMELINE_SOURCE 的文件及 locator。区分事件日期、记录日期与月份，不能用行序替代明确日期。多个事件记录可能描述同一业务变更，应结合证据合并叙述。若 TIMELINE_COVERAGE 显示遗漏，不要声称已列全；claims_omitted 表示只展示了该事件的部分事实。
 
 回答必须严格只有下面三个 Markdown 段落，标题文字保持不变：
 ## 1. 结论
@@ -288,6 +290,54 @@ class LeanGraphRAG:
                                         "text": f"{source} {shape.get('name','')} {text_value}"})
         return entries
 
+    @staticmethod
+    def _resolve_schema_hint(candidate, names):
+        """Resolve a textual candidate to the most specific existing schema name."""
+        value = norm(candidate).strip('“”"\'「」『』')
+        exact = [name for name in names if norm(name) == value]
+        if exact:
+            return sorted(exact)[0]
+        # Prefixes such as Excel"..." and Sheet的 belong to the question syntax.
+        # Prefer the longest suffix so 处理备注 is not resolved to the shorter 备注.
+        matches = [name for name in names if norm(name) and value.endswith(norm(name))]
+        if not matches:
+            return None
+        longest = max(len(norm(name)) for name in matches)
+        matches = [name for name in matches if len(norm(name)) == longest]
+        return sorted(matches)[0] if len({norm(name) for name in matches}) == 1 else None
+
+    def _structure_hints(self, question):
+        sheet_candidates, column_candidates = [], []
+        quoted = r'[“"\'「『]([^”"\'」』]{1,40})[”"\'」』]'
+        for match in re.finditer(quoted, question):
+            tail = question[match.end():]
+            # Only adjacent structural cues describe the quoted name. A later column
+            # reference must not turn the quoted sheet/product into a column hint.
+            if re.match(r'\s*(?:的\s*)?(?:sheet|工作表)', tail, flags=re.I):
+                sheet_candidates.append(match.group(1))
+            elif re.match(r'\s*(?:的\s*)?(?:列(?!出)|字段)', tail):
+                column_candidates.append(match.group(1))
+        for pattern in (r'([^\s，。,:：]{1,40})\s*(?:sheet|工作表)',
+                        r'(?:sheet|工作表)\s*[:：]\s*([^\s，。,:：]{1,40})'):
+            sheet_candidates.extend(m.group(1) for m in re.finditer(pattern, question, flags=re.I))
+        for match in re.finditer(r'([\u4e00-\u9fffA-Za-z0-9_\-]{1,40})列(?!出)', question):
+            candidate = re.sub(r'(?:的|中|里|内)$', '', match.group(1)).strip()
+            # 「列对应/列一致/列映射」描述表头关系，不是请求某个具体列。
+            if candidate and not re.match(r'(?:对应|一致|映射|关系|名称|定义)', question[match.end():]):
+                column_candidates.append(candidate)
+        entries = self.structured_entries
+        sheets = {e['sheet'] for e in entries if e.get('sheet')}
+        sheet_hints = list(dict.fromkeys(h for value in sheet_candidates
+                                       if (h := self._resolve_schema_hint(value, sheets))))
+        scoped = [e for e in entries if not sheet_hints or any(
+            norm(h) == norm(e.get('sheet', '')) for h in sheet_hints)]
+        fields = {e['field'] for e in scoped if e.get('field') and
+                  e.get('kind') in {'xlsx_cell', 'pdf_table_cell'}}
+        column_hints = list(dict.fromkeys(h for value in column_candidates
+                                        if (h := self._resolve_schema_hint(value, fields))))
+        # Keep an unknown requested field from silently widening to the whole sheet.
+        return sheet_hints, column_hints, bool(column_candidates)
+
     def _plan(self, question):
         q = question.strip()
         low = q.casefold()
@@ -298,10 +348,14 @@ class LeanGraphRAG:
         causal = any(x in low for x in ("为什么", "为何", "原因", "导致", "因果", "归因", "影响", "cause", "why"))
         # Do not mistake verbs such as “列出/逐一列出” for a spreadsheet column request.
         structured = bool(re.search(r"(?:sheet|工作表|字段|单元格|表格|page|页面|第?\d+页|slide|幻灯片|[\w\u4e00-\u9fff-]{1,18}列(?!出))", q, flags=re.I))
+        table_reconstruction = any(x in low for x in ("续表", "跨页", "表头", "列对应")) and any(
+            x in low for x in ("还原", "对应", "合并", "缺失", "清空"))
+        structured = structured or table_reconstruction
         list_all = any(x in low for x in ("找出", "列出", "全部", "所有", "哪些", "几条", "汇总"))
         comparison = any(x in low for x in ("比较", "对比", "分别", "变化", "差异"))
         rank = any(x in low for x in ("最大", "最小", "最高", "最低", "最多", "最少", "top"))
         timeline = any(x in low for x in ("时间线", "先后", "时间顺序", "历程"))
+        event_timeline = timeline and causal
         expected = None
         m = re.search(r"(?:找出|列出|共有|包含|前)?\s*(\d{1,3})\s*(?:条|个|项|种)", q)
         if m:
@@ -312,26 +366,16 @@ class LeanGraphRAG:
         }
         requested_formats = [fmt for fmt, cues in format_patterns.items() if any(c.casefold() in low for c in cues)]
         identity_words = ("名称", "称呼", "别名", "叫什么", "命名", "同一产品", "同一实体")
-        cross_format_identity = len(requested_formats) >= 2 and any(w in low for w in identity_words)
-        quoted = re.findall(r"[“\"'「『]([^”\"'」』]{1,40})[”\"'」』]", q)
-        sheet_hints, column_hints = [], []
-        for item in quoted:
-            pos = q.find(item)
-            tail = q[pos + len(item): pos + len(item) + 12].casefold() if pos >= 0 else ""
-            if "sheet" in tail or "工作表" in tail:
-                sheet_hints.append(item)
-            if re.search(r"列(?!出)|字段", tail):
-                column_hints.append(item)
-        for pat in (r"([^\s，。,:：]{1,24})\s*(?:sheet|工作表)", r"(?:sheet|工作表)\s*[:：]\s*([^\s，。,:：]{1,24})"):
-            for mm in re.finditer(pat, q, flags=re.I):
-                value = mm.group(1).strip("的中在从")
-                if value and value.casefold() not in {"excel", "xlsx"}:
-                    sheet_hints.append(value)
-        for mm in re.finditer(r"([\u4e00-\u9fffA-Za-z0-9_\-]{1,18})列(?!出)", q):
-            value = re.sub(r"^(?:哪些|所有|全部|第|的|中|在)+", "", mm.group(1))
-            value = re.sub(r"(?:的|中|里|内)$", "", value)
-            if value and value not in {"逐一", "一一", "请逐一", "请一一"}:
-                column_hints.append(value)
+        # Alias mentions can qualify a causal question without being its requested task.
+        cross_format_identity = (len(requested_formats) >= 2 and any(w in low for w in identity_words)
+                                 and not event_timeline)
+        sheet_hints, column_hints, column_requested = self._structure_hints(q)
+        # A deterministic sheet/field enumeration is a scope scan, not a ranking problem.
+        # Find the complete structural scope first; use GraphRAG only afterwards for explanation.
+        retrieval_mode = "exhaustive" if (
+            structured and list_all and bool(column_hints or (sheet_hints and not column_requested))
+            and not (event_timeline and not sheet_hints)
+        ) else "ranked"
         relation_weights = defaultdict(lambda: 0.4)
         if not cross_format_identity:
             for pred, words in RELATION_TERMS.items():
@@ -351,6 +395,10 @@ class LeanGraphRAG:
         keywords = [k for k in dict.fromkeys(keywords) if k.casefold() not in STOPWORDS and not str(k).isdigit()]
         if cross_format_identity:
             intent = "cross_format_identity"
+        elif retrieval_mode == "exhaustive":
+            intent = "structured_enumeration"
+        elif event_timeline:
+            intent = "causal"
         elif structured:
             intent = "structured_lookup"
         elif causal:
@@ -362,6 +410,8 @@ class LeanGraphRAG:
         else:
             intent = "factual"
         return {"intent": intent, "structured": structured, "cross_format_identity": cross_format_identity,
+                "table_reconstruction": table_reconstruction, "column_requested": column_requested,
+                "retrieval_mode": retrieval_mode,
                 "requested_formats": requested_formats, "list_all": list_all, "causal": causal,
                 "comparison": comparison, "rank": rank, "timeline": timeline, "expected_count": expected,
                 "sheet_hints": list(dict.fromkeys(sheet_hints)), "column_hints": list(dict.fromkeys(column_hints)),
@@ -392,14 +442,44 @@ class LeanGraphRAG:
     def _structured_retrieve(self, question, plan):
         if not self.structured_entries:
             return []
+        if plan.get("retrieval_mode") == "exhaustive":
+            # Exact structural scope wins over lexical relevance.  Never truncate matches here;
+            # ranking/salience is only metadata for second-stage augmentation.
+            pool = []
+            for entry in self.structured_entries:
+                if plan["sheet_hints"] and not any(norm(h) == norm(entry.get("sheet", "")) for h in plan["sheet_hints"]):
+                    continue
+                if plan["column_hints"] and not any(norm(h) == norm(entry.get("field", "")) for h in plan["column_hints"]):
+                    continue
+                if not str(entry.get("value", "")).strip():
+                    continue
+                pool.append(entry)
+            value_freq = Counter(norm(e.get("value", "")) for e in pool if e.get("value"))
+            hits = []
+            for entry in pool:
+                value = str(entry.get("value", ""))
+                repeat_count = value_freq[norm(value)]
+                salience = min(len(value) / 40.0, 1.5)
+                if re.search(r"\d|→|变|增|降|影响|风险|原因|归因|升级|替代|合并|并入|投诉|异常|停售|发布|修复", value):
+                    salience += 1.6
+                salience -= 1.0 * max(0, repeat_count - 1)
+                hits.append({**entry, "score": round(salience, 6), "salience": round(salience, 6),
+                             "repeat_count": repeat_count, "retrieval_mode": "exhaustive"})
+            hits.sort(key=lambda x: (x.get("locator", {}).get("row", 10**9),
+                                     str(x.get("locator", {}).get("cell", "")), x["id"]))
+            return hits
         base = self._bm25_rank(self.structured_bm25, self.structured_entries, question, max(self.top_structured * 2, 40))
+        # A requested column that does not exist in the schema must not silently widen to the
+        # whole sheet; returning unrelated rows would be worse than reporting no match.
+        if plan.get("column_requested") and not plan["column_hints"]:
+            return []
         pool = self.structured_entries if (plan["sheet_hints"] or plan["column_hints"]) else [x for x, _ in base]
         base_scores = {x["id"]: s for x, s in base}
         value_freq = Counter(norm(e.get("value", "")) for e in pool if e.get("value"))
         hits = []
         for e in pool:
-            sheet_match = not plan["sheet_hints"] or any(phrase_in(h, e.get("sheet", "")) for h in plan["sheet_hints"])
-            col_match = not plan["column_hints"] or any(phrase_in(h, e.get("field", "")) for h in plan["column_hints"])
+            sheet_match = not plan["sheet_hints"] or any(norm(h) == norm(e.get("sheet", "")) for h in plan["sheet_hints"])
+            col_match = not plan["column_hints"] or any(norm(h) == norm(e.get("field", "")) for h in plan["column_hints"])
             if (plan["sheet_hints"] and not sheet_match) or (plan["column_hints"] and not col_match):
                 continue
             value = str(e.get("value", ""))
@@ -413,6 +493,102 @@ class LeanGraphRAG:
         if plan.get("expected_count"):
             limit = max(limit, min(60, plan["expected_count"] * 3))
         return hits[:limit]
+
+    def _table_retrieve(self, question, plan):
+        """Retrieve a table with its inherited schema and all continuation chunks."""
+        if not plan.get("table_reconstruction"):
+            return []
+        tables = {uid: u for uid, u in self.units.items()
+                  if u.get("structured", {}).get("kind") == "pdf_table" and u['structured'].get('header')}
+        roots = {}
+
+        def root(uid, visiting=None):
+            if uid in roots:
+                return roots[uid]
+            visiting = (visiting or set()) | {uid}
+            unit = tables[uid]
+            st, loc = unit['structured'], unit.get('locator', {})
+            inherited = st.get('schema_inherited_from_page')
+            candidates = [key for key, other in tables.items() if key not in visiting
+                          and other['document_id'] == unit['document_id']
+                          and other.get('locator', {}).get('page') == inherited
+                          and [norm(x) for x in other['structured']['header']] == [norm(x) for x in st['header']]]
+            bbox = loc.get('bbox')
+            if bbox and candidates:
+                candidates = [key for key in candidates if not tables[key].get('locator', {}).get('bbox') or
+                              all(abs(float(tables[key]['locator']['bbox'][i]) - float(bbox[i])) <= 4 for i in (0, 2))]
+            if inherited is not None and candidates:
+                parent = max(candidates, key=lambda key: float(tables[key].get('locator', {}).get('bbox', [0, 0, 0, 0])[3]))
+                value = root(parent, visiting)
+            else:
+                value = (unit['document_id'], loc.get('page'), loc.get('table'))
+            roots[uid] = value
+            return value
+
+        groups = defaultdict(list)
+        for uid, unit in tables.items():
+            groups[root(uid)].append(unit)
+        if not groups:
+            return []
+        # Rank the table request separately from a secondary entity-association question.
+        primary = re.split(r'同时|此外|另外', question, maxsplit=1)[0]
+        page_text = defaultdict(str)
+        for unit in self.units.values():
+            if unit.get('structured', {}).get('kind') == 'pdf_page':
+                page_text[(unit['document_id'], unit.get('locator', {}).get('page'))] += unit.get('content_md', '')
+        keys = sorted(groups, key=str)
+        texts = []
+        for key in keys:
+            texts.append(' '.join(' '.join(map(str, u['structured']['header'])) * 3 + ' ' +
+                                 u.get('content_md', '') + ' ' + page_text[(u['document_id'], u.get('locator', {}).get('page'))][:800]
+                                 for u in groups[key]))
+        scores = BM25Lite([self._tokens(t) for t in texts]).scores(self._tokens(primary))
+        # A requested table name is stronger than generic words such as “对照”.
+        # Captions may omit the final 表, so also match the complete name stem.
+        names = []
+        for match in re.finditer(r'([\w\u4e00-\u9fff-]{3,40}表)(?=[（(的中，。])', primary):
+            name = re.split(r'中的|里的|中|的', match.group(1))[-1]
+            name = re.sub(r'^(?:请|根据|PDF|文档)+', '', name, flags=re.I)
+            stem = norm(name[:-1])
+            if len(stem) >= 4:
+                names.append(stem)
+        for i, text in enumerate(texts):
+            if any(name in norm(text) for name in names):
+                scores[i] += 40.0
+        best = max(range(len(keys)), key=lambda i: (scores[i], str(keys[i])))
+        if scores[best] <= 0:
+            return []
+        result = []
+        for unit in sorted(groups[keys[best]], key=lambda u: (u.get('locator', {}).get('page', 0),
+                           u.get('locator', {}).get('table', 0), u.get('locator', {}).get('row_start', 0), u['unit_id'])):
+            st = unit['structured']
+            result.append({'unit_id': unit['unit_id'], 'source': self.documents.get(unit['document_id'], {}).get('path', ''),
+                           'locator': unit.get('locator', {}), 'header': st['header'], 'records': st.get('records', []),
+                           'column_count': len(st['header']), 'schema_inherited_from_page': st.get('schema_inherited_from_page')})
+        return result
+
+    def _structured_rows(self, hits):
+        """Keep XLS row identifiers alongside matched attributes, across parsed chunks."""
+        selected = {}
+        for hit in hits:
+            if hit.get('kind') != 'xlsx_cell':
+                continue
+            key = (hit['document_id'], hit.get('sheet'), hit.get('locator', {}).get('row'))
+            selected[key] = max(selected.get(key, 0), hit.get('score', 0))
+        rows = defaultdict(dict)
+        for entry in self.structured_entries:
+            key = (entry.get('document_id'), entry.get('sheet'), entry.get('locator', {}).get('row'))
+            if entry.get('kind') == 'xlsx_cell' and key in selected:
+                rows[key][entry['locator']['cell']] = entry
+        result = []
+        for key in sorted(selected, key=lambda k: (-selected[k], str(k)))[:24]:
+            cells = sorted(rows[key].values(), key=lambda e: (len(self._col(e['locator']['cell'])), e['locator']['cell']))
+            if not cells:
+                continue
+            result.append({'source': cells[0]['source'], 'locator': {'sheet': key[1], 'row': key[2]},
+                           'entry_ids': [e['id'] for e in cells],
+                           'cells': [{'cell': e['locator']['cell'], 'field': e['field'], 'value': e['value']} for e in cells]})
+        return result
 
     def _fact_retrieve(self, question, plan):
         ranked = self._bm25_rank(self.fact_bm25, self.fact_entries, question, max(self.top_facts * 4, 50))
@@ -465,6 +641,80 @@ class LeanGraphRAG:
         n = self.nodes[nid]
         facts = [self.facts[fid] for fid in self.subject_facts.get(nid, [])[:20] if fid in self.facts]
         return " ".join([n.get("name", ""), *n.get("aliases", []), compact(facts)])
+
+    def _timeline_retrieve(self, question, plan):
+        """Collect event evidence by target identity, independent of lexical Top-K and beam rank."""
+        if not (plan.get('timeline') and plan.get('causal')) or plan.get('retrieval_mode') == 'exhaustive':
+            return []
+        targets = {nid for nid, n in self.nodes.items() if n.get('type') in {'Product', 'AITool', 'DataAsset'}
+                   and any(len(norm(label)) >= 2 and phrase_in(label, question) for label in self.labels[nid])}
+        event_ids = {other for target in targets for other, _, _ in self.adjacency.get(target, [])
+                     if self.nodes[other].get('type') == 'Event'}
+        # Follow event-to-event causal/sequence links, never a shared tool/person or reused record ID.
+        frontier = set(event_ids)
+        for _ in range(2):
+            more = {other for eid in frontier for other, edge, _ in self.adjacency.get(eid, [])
+                    if self.nodes[other].get('type') == 'Event' and edge.get('predicate') not in
+                    {'reuses_identifier_of', 'linked_to', 'has_participant', 'cites_data'}} - event_ids
+            event_ids.update(more)
+            frontier = more
+        temporal = r'date|time|period|日期|时间|月份|季度'
+        date_pattern = r'(?<!\d)(20\d{2})[-/年](0?[1-9]|1[0-2])(?!\d)(?:[-/月](0?[1-9]|[12]\d|3[01])(?!\d))?'
+        hits = []
+        for eid in sorted(event_ids):
+            own = [self.facts[fid] for fid in self.subject_facts.get(eid, [])]
+            dates, temporal_ids, date_fields = set(), set(), set()
+            for f in own:
+                qualifiers = f.get('qualifiers', {})
+                values = [(k, v) for k, v in qualifiers.items() if re.search(temporal, str(k), re.I)]
+                if f.get('predicate') in {'event_time', 'recorded_time'} or re.search(
+                        temporal, str(qualifiers.get('attribute', '')), re.I):
+                    value = f.get('value', '')
+                    values.append((qualifiers.get('attribute') or f['predicate'],
+                                   value.get('value', value.get('raw', '')) if isinstance(value, dict) else value))
+                for field, value in values:
+                    for year, month, day in re.findall(date_pattern, str(value)):
+                        dates.add(f'{int(year):04d}-{int(month):02d}' + (f'-{int(day):02d}' if day else ''))
+                        temporal_ids.add(f['fact_id'])
+                        date_fields.add(str(field))
+            if dates and not any(
+                    (not plan['years'] or d[:4] in plan['years']) and
+                    (not plan['months'] or int(d[5:7]) in plan['months']) and
+                    (not plan['quarters'] or (int(d[5:7]) - 1) // 3 + 1 in plan['quarters']) for d in dates):
+                continue
+            linked = {fid for other, edge, _ in self.adjacency.get(eid, [])
+                      if other in targets or other in event_ids for fid in edge.get('fact_ids', [])}
+            relevant = {f['fact_id']: f for f in own}
+            relevant.update({fid: self.facts[fid] for fid in linked if fid in self.facts})
+            def priority(f):
+                if f['fact_id'] in temporal_ids:
+                    return 0
+                if f.get('object') and (f.get('subject') in targets or f.get('object') in targets):
+                    return 1
+                if re.search(r'变|模式|原因|影响|内容|停更|reason|impact|change|transition',
+                             compact(f.get('qualifiers', {})) + f.get('predicate', ''), re.I):
+                    return 2
+                return 3 if f.get('object') else 4
+            selected = sorted(relevant.values(), key=lambda f: (priority(f), f['fact_id']))[:8]
+            evidence_ids = sorted({ev for f in selected for ev in f.get('evidence_ids', [])})
+            claims = []
+            for f in selected:
+                claim = {'fact_id': f['fact_id'], 'subject': self.nodes.get(f['subject'], {}).get('name'),
+                         'predicate': f['predicate'], 'evidence_ids': f.get('evidence_ids', [])}
+                claim.update({'object': self.nodes.get(f['object'], {}).get('name')} if f.get('object')
+                             else {'value': f.get('value')})
+                if f.get('qualifiers'):
+                    claim['qualifiers'] = f['qualifiers']
+                claims.append(claim)
+            sources = [{'evidence_id': ev, 'source': self.evidence[ev].get('source') or
+                        self.documents.get(self.evidence[ev].get('document_id'), {}).get('path', ''),
+                        'locator': self.evidence[ev].get('locator', {})} for ev in evidence_ids if ev in self.evidence]
+            hits.append({'event': {'id': eid, 'name': self.nodes[eid].get('name')}, 'dates': sorted(dates),
+                         'date_fields': sorted(date_fields),
+                         'date_status': 'documented' if dates else 'not_recorded', 'claims': claims,
+                         'claims_omitted': len(relevant) - len(selected), 'sources': sources})
+        hits.sort(key=lambda h: (h['dates'][0] if h['dates'] else '9999', h['event']['id']))
+        return hits
 
     def _path_step_score(self, current, neighbor, edge, plan):
         relation = plan["relation_weights"].get(edge.get("predicate"), 0.4)
@@ -676,12 +926,41 @@ class LeanGraphRAG:
             raise ValueError("question 必须是非空字符串")
         plan = self._plan(question)
         structured_hits = self._structured_retrieve(question, plan)
-        fact_hits = self._fact_retrieve(question, plan)
-        preliminary_raw = self._raw_retrieve([question], limit=max(6, self.top_units // 2), requested_formats=plan.get("requested_formats"))
-        entity_candidates = self._entity_candidates(question, fact_hits, preliminary_raw)
+        table_hits = self._table_retrieve(question, plan)
+        structured_rows = self._structured_rows(structured_hits) if table_hits else []
+
+        # For deterministic enumerations, first locate the complete sheet/field scope, then
+        # let Fact/Graph retrieval explain the located records.  This prevents BM25/RRF
+        # from pushing exact structural evidence out of the context.
+        semantic_query = question
+        augmentation_plan = plan
+        augmentation_sources = []
+        if plan.get("retrieval_mode") == "exhaustive" and structured_hits:
+            by_salience = sorted(structured_hits, key=lambda x: (-x.get("salience", 0.0), x["id"]))
+            expected = plan.get("expected_count") or 8
+            take = max(1, min(24, expected))
+            seen_values = set()
+            for hit in by_salience:
+                key = norm(hit.get("value", ""))
+                if key in seen_values:
+                    continue
+                seen_values.add(key)
+                augmentation_sources.append(hit)
+                if len(augmentation_sources) >= take:
+                    break
+            located_values = [str(x.get("value", ""))[:180] for x in augmentation_sources]
+            semantic_query = (question + " " + " ".join(located_values))[:4000]
+            augmentation_plan = self._plan(semantic_query)
+
+        fact_hits = self._fact_retrieve(semantic_query, augmentation_plan)
+        raw_queries = list(dict.fromkeys([question, semantic_query]))
+        preliminary_raw = self._raw_retrieve(raw_queries, limit=max(6, self.top_units // 2),
+                                             requested_formats=plan.get("requested_formats"))
+        entity_candidates = self._entity_candidates(semantic_query, fact_hits, preliminary_raw)
         entity_profiles = [self._entity_profile(x["node_id"]) for x in entity_candidates[:4]]
+        timeline_hits = self._timeline_retrieve(question, plan)
         # Identity/source-comparison questions do not benefit from relation-path wandering.
-        paths = [] if plan.get("cross_format_identity") else self._beam_search(entity_candidates[:self.max_seeds], plan)
+        paths = [] if plan.get("cross_format_identity") else self._beam_search(entity_candidates[:self.max_seeds], augmentation_plan)
         fusion = self._rrf(structured_hits, fact_hits, paths)
         fusion_scores = {x["key"]: x["rrf_score"] for x in fusion}
         for hit in structured_hits:
@@ -714,10 +993,20 @@ class LeanGraphRAG:
                 merged_raw.append(item)
             raw_hits = merged_raw[: max(self.top_units, len(plan.get("requested_formats", [])) * 2)]
         result = {"question": question, "query_plan": plan, "structured_hits": structured_hits,
+                  "table_hits": table_hits, "structured_rows": structured_rows, "timeline_hits": timeline_hits,
                   "fact_hits": fact_hits, "entity_candidates": entity_candidates, "entity_profiles": entity_profiles,
                   "paths": paths, "fusion": fusion, "raw_units": raw_hits,
+                  "augmentation_sources": augmentation_sources,
+                  "augmentation_query": semantic_query if semantic_query != question else None,
                   "stats": {"structured": len(structured_hits), "facts": len(fact_hits), "seeds": min(len(entity_candidates), self.max_seeds),
-                            "profiles": len(entity_profiles), "paths": len(paths), "raw_units": len(raw_hits)}}
+                            "profiles": len(entity_profiles), "paths": len(paths), "raw_units": len(raw_hits),
+                            "timeline_events": len(timeline_hits),
+                            "retrieval_mode": plan.get("retrieval_mode", "ranked"),
+                            "table_units": len(table_hits), "table_rows": sum(len(t['records']) for t in table_hits),
+                            "table_columns": max((t['column_count'] for t in table_hits), default=0),
+                            "structured_rows": len(structured_rows),
+                            "structured_scope_matches": len(structured_hits) if plan.get("retrieval_mode") == "exhaustive" else 0,
+                            "structured_selected_for_augmentation": len(augmentation_sources)}}
         result["context"] = self.build_context(result)
         return result
 
@@ -754,17 +1043,126 @@ class LeanGraphRAG:
             parts.append(block)
             return True
 
+        timeline_hits = result.get('timeline_hits', [])
+        included_events = 0
+        if timeline_hits:
+            # Share locators across events and emit a compact inventory before optional detail.
+            # Otherwise repeated source/claim JSON can consume the budget before later dates.
+            budget -= 180
+            source_ids, evidence_sources = {}, {}
+            for event in timeline_hits:
+                for source in event['sources']:
+                    value = {k: source[k] for k in ('source', 'locator')}
+                    key = compact(value)
+                    if key not in source_ids:
+                        sid = 't' + str(len(source_ids) + 1)
+                        if append('TIMELINE_SOURCE ' + compact({'id': sid, **value})):
+                            source_ids[key] = sid
+                    if key in source_ids:
+                        evidence_sources[source['evidence_id']] = source_ids[key]
+            for event in timeline_hits:
+                candidates = [c for c in event['claims'] if c['predicate'] not in {'event_time', 'recorded_time'}
+                              and not re.search(r'date|time|日期|时间',
+                                  str(c.get('qualifiers', {}).get('attribute', '')), re.I)]
+                changes = [c for c in candidates if not c.get('object') and re.search(
+                    r'变|模式|原因|影响|内容|停更|reason|impact|change|transition', compact(c.get('qualifiers', {})), re.I)]
+                chosen = []
+                for c in [*changes[:2], *[c for c in candidates if c.get('object')], *candidates]:
+                    if c not in chosen:
+                        chosen.append(c)
+                    if len(chosen) == 2:
+                        break
+                claims = []
+                for claim in chosen:
+                    value = {k: v for k, v in claim.items() if k not in {'fact_id', 'evidence_ids', 'subject'}}
+                    if claim.get('subject') != event['event']['name']:
+                        value['subject'] = claim.get('subject')
+                    value['sources'] = sorted({evidence_sources[ev] for ev in claim['evidence_ids']
+                                               if ev in evidence_sources})
+                    claims.append(value)
+                event_sources = sorted({evidence_sources[s['evidence_id']] for s in event['sources']
+                                        if s['evidence_id'] in evidence_sources})
+                overview = {k: event[k] for k in ('event', 'dates', 'date_fields', 'date_status')}
+                overview['event'] = event['event']['name']
+                overview.update(claims=claims, sources=event_sources,
+                                claims_omitted=event['claims_omitted'] + len(event['claims']) - len(chosen))
+                if event_sources and append('TIMELINE_EVENT ' + compact(overview)):
+                    included_events += 1
+            budget += 180
+            append('TIMELINE_COVERAGE ' + compact({'events_total': len(timeline_hits),
+                'events_included': included_events, 'events_omitted': len(timeline_hits) - included_events}))
+        result['stats']['timeline_context_events'] = included_events
+        result['stats']['timeline_context_events_omitted'] = len(timeline_hits) - included_events
+
+        # Schema and complete rows are atomic evidence; never slice a table row or JSON.
+        included_table_units = set()
+        included_rows = 0
+        table_hits = result.get('table_hits', [])
+        table_row_count = sum(len(t['records']) for t in table_hits)
+        coverage_reserve = 160 if table_hits else 0
+        budget -= coverage_reserve
+        for table in table_hits:
+            schema = {k: v for k, v in table.items() if k != 'records'}
+            if append('TABLE_SCHEMA ' + compact(schema)):
+                included_table_units.add(table['unit_id'])
+        for table in table_hits:
+            if table['unit_id'] not in included_table_units:
+                continue
+            for index, values in enumerate(table['records'], start=table['locator'].get('row_start', 1)):
+                block = 'TABLE_ROW ' + compact({'unit_id': table['unit_id'],
+                    'locator': {**{k: v for k, v in table['locator'].items() if k in ('page', 'table')}, 'row': index},
+                    'values': values})
+                if append(block):
+                    included_rows += 1
+        budget += coverage_reserve
+        if table_hits:
+            append('TABLE_COVERAGE ' + compact({'rows_total': table_row_count, 'rows_included': included_rows,
+                                               'rows_omitted': table_row_count - included_rows,
+                                               'schemas_omitted': len(table_hits) - len(included_table_units)}))
+        included_entry_ids = set()
+        for row in result.get('structured_rows', []):
+            if append('STRUCTURED_ROW ' + compact({k: v for k, v in row.items() if k != 'entry_ids'})):
+                included_entry_ids.update(row['entry_ids'])
+        result['stats']['table_context_rows'] = included_rows
+        result['stats']['table_context_rows_omitted'] = table_row_count - included_rows
+
         # Entity identity must not disappear between retrieval and generation.
         for profile in result.get("entity_profiles", [])[:3]:
             append("ENTITY_PROFILE " + compact(profile), cap=2600)
 
-        # Structured hits first when the query asks for an explicit table/sheet scan.
-        structured_limit = self.top_structured if result["query_plan"].get("structured") else min(8, self.top_structured)
-        for hit in result["structured_hits"][:structured_limit]:
+        # Exact structural enumerations are primary evidence: include them before any
+        # BM25/Fact/Graph material can consume the context budget.
+        if result["query_plan"].get("retrieval_mode") == "exhaustive":
+            # An exhaustive enumeration must not be silently truncated by a fixed record cap;
+            # the context budget is the only limit, and any omission is reported.
+            structured_limit = len(result["structured_hits"])
+            exhaustive = True
+        else:
+            exhaustive = False
+            structured_limit = self.top_structured if result["query_plan"].get("structured") else min(8, self.top_structured)
+        structured_included = 0
+        structured_omitted = 0
+        structured_candidates = result["structured_hits"][:structured_limit]
+        for hit in structured_candidates:
+            if hit['id'] in included_entry_ids or hit.get('unit_id') in included_table_units:
+                continue
             block = "STRUCTURED_SOURCE " + compact({"source": hit.get("source"), "locator": hit.get("locator"),
-                                                       "field": hit.get("field"), "value": hit.get("value"), "hidden": hit.get("hidden", False)})
-            if not append(block, cap=900):
-                break
+                                                       "field": hit.get("field"), "value": hit.get("value"), "hidden": hit.get("hidden", False),
+                                                       "retrieval_mode": hit.get("retrieval_mode"), "salience": hit.get("salience")})
+            # Cell values are atomic evidence: include the whole record or omit it, never slice it.
+            if not append(block, cap=None if exhaustive else 900):
+                structured_omitted += 1
+                continue
+            structured_included += 1
+        structured_total = sum(1 for hit in structured_candidates
+                               if hit['id'] not in included_entry_ids
+                               and hit.get('unit_id') not in included_table_units)
+        if result["query_plan"].get("retrieval_mode") == "exhaustive":
+            append("STRUCTURED_COVERAGE " + compact({"records_total": structured_total,
+                                                      "records_included": structured_included,
+                                                      "records_omitted": structured_total - structured_included}))
+        result['stats']['structured_context_records'] = structured_included
+        result['stats']['structured_context_records_omitted'] = structured_total - structured_included
 
         # Reserve raw-source coverage early; do not let repeated facts starve the actual documents.
         raw_first = result.get("raw_units", [])

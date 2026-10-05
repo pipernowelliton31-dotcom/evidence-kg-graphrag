@@ -5,10 +5,13 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import shutil
 import sys
 from pathlib import Path
 
-from kg_core import (ContractError, accept_alignment, accept_extractions, alignment_tasks,
+from kg_core import (ENGINE_VERSION, SCHEMA_VERSION, ContractError, _repair_identity_metadata,
+                     accept_alignment, accept_extractions, alignment_tasks, empty_alignment,
+                     engine_signature, ident,
                      build_graph, extraction_plan, extraction_tasks, load_state, prepare_selective_extraction,
                      read_json, require, save_state, validate_graph, write_json)
 
@@ -37,6 +40,8 @@ def cli():
     prepare = subs.add_parser("prepare", help="Run cheap selective-extraction planning and deterministic prepass")
     prepare.add_argument("--work", required=True)
     prepare.add_argument("--output")
+    reset = subs.add_parser("reset-alignment", help="Archive alignment and graph; repair derived IDs while retaining extraction")
+    reset.add_argument("--work", required=True)
     tasks = subs.add_parser("tasks", help="Export host extraction/alignment tasks")
     tasks.add_argument("--work", required=True)
     tasks.add_argument("--stage", choices=["extract", "align"], required=True)
@@ -78,6 +83,43 @@ def cli():
                 report["valid"] = False
         emit(report)
         return 0 if report["valid"] else 2
+    if args.command == "reset-alignment":
+        # This is the explicit migration path for a checkpoint made by the previous engine.
+        # Ordinary tasks still reject changed scripts and stale responses.
+        work = Path(args.work).resolve()
+        state = read_json(work / "state.json")
+        require(state.get("schema_version") == SCHEMA_VERSION, "Unsupported state schema")
+        require(state.get("engine_version") == ENGINE_VERSION, "Reparse after engine version changes")
+        parsed = read_json(work / "00_document_units.json")
+        require(parsed.get("fingerprint") == state["fingerprint"] and
+                parsed.get("units") == state["units"] and parsed.get("documents") == state["documents"],
+                "Parsed artifacts do not match the extraction checkpoint")
+        revised = copy.deepcopy(state)
+        changes = _repair_identity_metadata(revised)
+        revised["alignment"] = empty_alignment()
+        revised["engine_signature"] = engine_signature()
+        revised["fingerprint"] = ident("run", [state["fingerprint"], revised["engine_signature"], "reset-alignment"])
+        revised["audit"].append({"action": "reset_alignment", "previous_fingerprint": state["fingerprint"],
+                                 "previous_engine_signature": state.get("engine_signature"),
+                                 "previous_clusters": len(state["alignment"]["clusters"])})
+        names = ("state.json", "00_document_units.json", "00_extraction_plan.json", "01_mentions.json",
+                 "02_entity_map.json", "03_canonical_facts.json", "04_knowledge_graph.json")
+        archive = work / "archive" / ident("alignment_reset", [state["fingerprint"], state["alignment"]])
+        archive.mkdir(parents=True, exist_ok=False)
+        for name in names:
+            if (work / name).is_file():
+                shutil.copy2(work / name, archive / name)
+        for name in ("03_canonical_facts.json", "04_knowledge_graph.json"):
+            (work / name).unlink(missing_ok=True)
+        for name in ("00_document_units.json", "00_extraction_plan.json"):
+            if (work / name).is_file():
+                artifact = read_json(work / name)
+                artifact["fingerprint"] = revised["fingerprint"]
+                write_json(work / name, artifact)
+        save_state(work, revised)
+        emit({"ok": True, "fingerprint": revised["fingerprint"], "archive": str(archive),
+              "identity_metadata_changes": len(changes), "next": "tasks --stage align"})
+        return 0
     state = load_state(args.work)
     if args.command == "prepare":
         state, plan = prepare_selective_extraction(state)

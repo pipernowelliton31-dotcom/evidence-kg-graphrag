@@ -57,6 +57,129 @@ def md_table(rows):
     return "\n".join([row_line(rows[0]), row_line(["---"] * width), *[row_line(r) for r in rows[1:]]])
 
 
+def _pdf_same_x_span(a, b, tolerance=18.0):
+    if not a or not b or len(a) != 4 or len(b) != 4:
+        return False
+    try:
+        return abs(float(a[0]) - float(b[0])) <= tolerance and abs(float(a[2]) - float(b[2])) <= tolerance
+    except (TypeError, ValueError):
+        return False
+
+
+def _pdf_words_in_bbox(words, bbox, pad=1.5):
+    x0, top, x1, bottom = map(float, bbox)
+    return [w for w in words
+            if float(w["x1"]) >= x0 - pad and float(w["x0"]) <= x1 + pad
+            and float(w["bottom"]) >= top - pad and float(w["top"]) <= bottom + pad]
+
+
+def _pdf_merge_cell_words(words):
+    if not words:
+        return ""
+    ordered = sorted(words, key=lambda w: (float(w["top"]), float(w["x0"])))
+    lines = []
+    for word in ordered:
+        top = float(word["top"])
+        if not lines or abs(top - lines[-1][0]) > 3.0:
+            lines.append([top, [word]])
+        else:
+            lines[-1][1].append(word)
+    rendered = []
+    for _, line_words in lines:
+        line_words.sort(key=lambda w: float(w["x0"]))
+        text, previous = "", None
+        for word in line_words:
+            token = str(word["text"])
+            if previous is not None:
+                gap = float(word["x0"]) - float(previous["x1"])
+                if (gap > 2.5 and re.search(r"[A-Za-z0-9]$", str(previous["text"]))
+                        and re.match(r"^[A-Za-z0-9]", token)):
+                    text += " "
+            text += token
+            previous = word
+        rendered.append(text)
+    return "\n".join(rendered)
+
+
+def _pdf_infer_header_schema(words, row_bbox, table_bbox, page_number):
+    header_words = _pdf_words_in_bbox(words, row_bbox)
+    if len(header_words) < 2:
+        return None
+    clusters = []
+    for word in sorted(header_words, key=lambda w: (float(w["x0"]), float(w["top"]))):
+        wx0, wx1 = float(word["x0"]), float(word["x1"])
+        best, best_score = None, -1e9
+        for cluster in clusters:
+            overlap = min(cluster["x1"], wx1) - max(cluster["x0"], wx0)
+            gap = max(cluster["x0"] - wx1, wx0 - cluster["x1"], 0)
+            score = overlap if overlap >= 0 else -gap
+            if (overlap >= -2.0 or gap <= 8.0) and score > best_score:
+                best, best_score = cluster, score
+        if best is None:
+            clusters.append({"x0": wx0, "x1": wx1, "words": [word]})
+        else:
+            best["x0"] = min(best["x0"], wx0)
+            best["x1"] = max(best["x1"], wx1)
+            best["words"].append(word)
+    clusters.sort(key=lambda c: c["x0"])
+    clusters = [c for c in clusters
+                if re.search(r"[A-Za-z0-9\u4e00-\u9fff]", _pdf_merge_cell_words(c["words"]))]
+    if len(clusters) < 2:
+        return None
+    x0, _, x1, _ = map(float, table_bbox)
+    cuts = [x0]
+    for left, right in zip(clusters, clusters[1:]):
+        cuts.append((left["x1"] + right["x0"]) / 2.0)
+    cuts.append(x1)
+    header = [_pdf_merge_cell_words(c["words"]).replace("\n", "") for c in clusters]
+    bounds = [(cuts[i], cuts[i + 1]) for i in range(len(header))]
+    return {"page": page_number, "header": header, "bounds": bounds,
+            "bbox": list(map(float, table_bbox))}
+
+
+def _pdf_row_from_schema(words, row_bbox, schema):
+    row_words = _pdf_words_in_bbox(words, row_bbox)
+    cells = []
+    last_right = schema["bounds"][-1][1]
+    for left, right in schema["bounds"]:
+        selected = []
+        for word in row_words:
+            center = (float(word["x0"]) + float(word["x1"])) / 2.0
+            in_band = left <= center < right or (right == last_right and left <= center <= right)
+            if in_band:
+                selected.append(word)
+        cells.append(_pdf_merge_cell_words(selected))
+    return cells
+
+
+def _pdf_reconstruct_table(words, table, previous_schema, page_number):
+    rows = list(getattr(table, "rows", []) or [])
+    if not rows:
+        raw = table.extract() or []
+        return (raw[0], raw[1:], None) if raw else ([], [], None)
+    if (previous_schema and previous_schema.get("bounds") and previous_schema.get("page") == page_number - 1
+            and _pdf_same_x_span(previous_schema.get("bbox"), table.bbox)):
+        first = _pdf_row_from_schema(words, rows[0].bbox, previous_schema)
+        old = [norm for norm in (re.sub(r"\s+", "", x) for x in previous_schema["header"])]
+        now = [norm for norm in (re.sub(r"\s+", "", x) for x in first)]
+        matches = sum(bool(a and b and (a == b or a in b or b in a)) for a, b in zip(old, now))
+        repeated_header = matches >= max(2, len(old) // 2)
+        start = 1 if repeated_header else 0
+        data_rows = [_pdf_row_from_schema(words, row.bbox, previous_schema) for row in rows[start:]]
+        schema = {**previous_schema, "page": page_number, "bbox": list(map(float, table.bbox)),
+                  "inherited_from_page": previous_schema["page"]}
+        return list(previous_schema["header"]), data_rows, schema
+    schema = _pdf_infer_header_schema(words, rows[0].bbox, table.bbox, page_number)
+    if schema:
+        data_rows = [_pdf_row_from_schema(words, row.bbox, schema) for row in rows[1:]]
+        return list(schema["header"]), data_rows, schema
+    raw = table.extract() or []
+    if not raw:
+        return [], [], None
+    return raw[0], raw[1:], {"page": page_number, "header": raw[0],
+                             "bbox": list(map(float, table.bbox))}
+
+
 def split_text(text, budget):
     """Split on paragraphs/lines; only oversized plain prose is split at sentence boundaries."""
     result, current = [], ""
@@ -331,8 +454,11 @@ class Adapter:
     def pdf(self):
         import pdfplumber
         with pdfplumber.open(self.path) as pdf:
+            previous_page_schemas = []
             for pi, page in enumerate(pdf.pages, 1):
                 tables = page.find_tables()
+                raw_words = page.extract_words(x_tolerance=1, y_tolerance=2,
+                                               keep_blank_chars=False, use_text_flow=False)
                 text = clean(page.extract_text(layout=True) or "").strip()
                 warnings, assets = [], []
                 # Render only when the text layer is weak or the page contains raster imagery.
@@ -351,20 +477,34 @@ class Adapter:
                     warnings.append("no_text_layer: host_visual_extraction_required")
                 elif not needs_visual:
                     warnings.append("page_image_skipped_text_layer_sufficient")
-                words = [{"text": w["text"], "bbox": [str(w[k]) for k in ("x0", "top", "x1", "bottom")]} for w in page.extract_words()]
+                words = [{"text": w["text"], "bbox": [str(w[k]) for k in ("x0", "top", "x1", "bottom")]} for w in raw_words]
                 self.add(text or "[No PDF text layer; inspect supplied page image]", {"page": pi, "bbox": ["0", "0", str(page.width), str(page.height)]},
                          assets=assets, warnings=warnings, structured={"kind": "pdf_page", "words": words})
+                current_page_schemas = []
                 for ti, table in enumerate(tables, 1):
-                    rows = table.extract()
-                    if not rows:
+                    # Equal widths are common across unrelated tables in one document.
+                    # A continuation must connect the previous page's bottom table to
+                    # the next page's first table near the top of its body.
+                    previous = next((schema for schema in sorted(previous_page_schemas,
+                                     key=lambda s: s['bbox'][3], reverse=True)
+                                     if ti == 1 and float(table.bbox[1]) <= float(page.height) * 0.15
+                                     and float(schema['bbox'][3]) >= float(schema['page_height']) * 0.80
+                                     and _pdf_same_x_span(schema.get("bbox"), table.bbox)), None)
+                    header, data_rows, schema = _pdf_reconstruct_table(raw_words, table, previous, pi)
+                    if not header and not data_rows:
                         continue
-                    header = rows[0]
-                    self.table_batches(rows[1:], header, {"page": pi, "table": ti, "bbox": [str(v) for v in table.bbox]},
-                        lambda row: row, "pdf_table", first_record=2, extra={"header": header,
-                        "blank_policy": "preserve; do not infer across pages"})
+                    inherited_from = schema.get("inherited_from_page") if schema else None
+                    if schema and len(header) >= 2:
+                        schema['page_height'] = float(page.height)
+                        current_page_schemas.append(schema)
+                    self.table_batches(data_rows, header, {"page": pi, "table": ti, "bbox": [str(v) for v in table.bbox]},
+                        lambda row: row, "pdf_table", first_record=1 if inherited_from else 2,
+                        extra={"header": header, "schema_inherited_from_page": inherited_from,
+                               "blank_policy": "preserve cells; inherit adjacent-page x-aligned schema only"})
                     for unit in self.units:
                         if unit["locator"].get("page") == pi and unit["locator"].get("table") == ti:
                             unit["asset_refs"] = assets
+                previous_page_schemas = current_page_schemas
                 if not tables:
                     self.units[-1]["parse_warnings"].append("no_ruled_table_detected: inspect text for borderless tables")
 
