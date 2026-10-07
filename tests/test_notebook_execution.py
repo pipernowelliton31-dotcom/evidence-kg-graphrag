@@ -83,7 +83,7 @@ class NotebookExecutionTests(unittest.TestCase):
         return {'RUN_ROOT': self.run, 'WORK_DIR': self.run / 'work',
                 'MODEL_OUTPUT_DIR': self.run / 'models', 'MANIFEST_PATH': self.run / 'inputs.json',
                 'OPENROUTER_API_KEY': 'mock-only', 'RAG_SEARCH_ROOT': self.run,
-                'RAG_FALLBACK_DIR': self.native}
+                'RAG_FALLBACK_DIR': self.native, 'QA_MAX_TOKENS': 4096}
 
     def test_config_then_skill_setup_in_fresh_kernel(self):
         ns = {}

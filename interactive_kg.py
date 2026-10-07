@@ -18,7 +18,7 @@ from pathlib import Path
 
 SUPPORTED = {".pdf", ".docx", ".xlsx", ".pptx", ".png", ".jpg", ".jpeg", ".webp", ".md", ".txt"}
 HELPERS = {"run_cli", "_extract_json_object", "_data_url", "_batch_content",
-           "call_openrouter_batch", "call_final_answer"}
+           "_normalize_model_text", "_write_model_text", "call_openrouter_batch", "call_final_answer"}
 MODEL_DEFAULTS = {
     "EXTRACT_MAX_TOKENS": 10000, "ALIGN_MAX_TOKENS": 3000, "QA_MAX_TOKENS": 4096,
     "HTTP_TIMEOUT": 300, "MAX_NETWORK_RETRIES": 2,
@@ -49,12 +49,34 @@ def notebook_runtime(notebook_path, overrides=None):
                     ast.Constant(str(notebook_path.parent / node.args[0].value)), node.args[0])
             return node
 
-    anchored_config = AnchorPaths().visit(ast.Module(body=assignments, type_ignores=[]))
-    exec(compile(ast.fix_missing_locations(anchored_config), str(notebook_path), "exec"), namespace)
     override_names = {t.id for n in assignments for t in n.targets if isinstance(t, ast.Name)}
     override_names |= MODEL_DEFAULTS.keys()
     override_names |= {"SKILL_DIR", "SCRIPTS_DIR", "OPENROUTER_API_KEY", "call_logs", "ROLE_OVERRIDES"}
-    namespace.update({k: v for k, v in (overrides or {}).items() if k in override_names})
+    settings = {k: v for k, v in (overrides or {}).items() if k in override_names}
+    path_names = {"SKILL_ZIP", "SKILL_SRC", "SKILL_DIR", "SCRIPTS_DIR", "MATERIALS_ROOT",
+                  "RUN_ROOT", "SKILL_UNPACK_DIR", "WORK_DIR", "MODEL_OUTPUT_DIR", "MANIFEST_PATH",
+                  "RAG_SEARCH_ROOT", "RAG_FALLBACK_DIR", "RAG_WORK_DIR"}
+
+    def runtime_value(name, value):
+        if name in path_names and value is not None:
+            value = Path(value).expanduser()
+            if not value.is_absolute():
+                value = notebook_path.parent / value
+            return value.resolve()
+        return value
+
+    # Apply upstream overrides before computing paths derived from them. Never mix
+    # a project's RUN_ROOT with the notebook's default model_outputs/work directory.
+    for assignment in assignments:
+        targets = [t.id for t in assignment.targets if isinstance(t, ast.Name)]
+        if len(targets) == 1 and targets[0] in settings:
+            namespace[targets[0]] = runtime_value(targets[0], settings[targets[0]])
+        else:
+            statement = AnchorPaths().visit(ast.Module(body=[assignment], type_ignores=[]))
+            exec(compile(ast.fix_missing_locations(statement), str(notebook_path), "exec"), namespace)
+            for name in targets:
+                namespace[name] = runtime_value(name, namespace[name])
+    namespace.update({k: runtime_value(k, v) for k, v in settings.items()})
     namespace.setdefault("ROLE_OVERRIDES", {})
     namespace["ROLE_OVERRIDES"] = dict(namespace["ROLE_OVERRIDES"])
     namespace["ROLE_OVERRIDES"].setdefault("测试集A_分析问题集.docx", "questions")
@@ -248,6 +270,8 @@ class InteractiveKGSession:
     def _run_stage(self, stage):
         ns = self.runtime
         work, run_root, model_root = map(Path, (ns["WORK_DIR"], ns["RUN_ROOT"], ns["MODEL_OUTPUT_DIR"]))
+        run_root.mkdir(parents=True, exist_ok=True)
+        model_root.mkdir(parents=True, exist_ok=True)
         label = "Extraction" if stage == "extract" else "Alignment"
         concurrency = ns["EXTRACT_CONCURRENCY"] if stage == "extract" else ns["ALIGN_CONCURRENCY"]
         limit = ns["EXTRACT_BATCH_SIZE"] if stage == "extract" else ns["ALIGN_BATCH_SIZE"]
@@ -275,6 +299,7 @@ class InteractiveKGSession:
                 raise RuntimeError(f"{label} 未推进，已保留 checkpoint；请检查模型的 task_id/decision")
             previous_position = position
             failures = []
+            accepted_count = 0
             started = time.perf_counter()
             with ThreadPoolExecutor(max_workers=min(concurrency, len(batches))) as pool:
                 futures = {pool.submit(ns["call_openrouter_batch"], stage, batch,
@@ -294,8 +319,9 @@ class InteractiveKGSession:
                             self.progress(f"[{stage}] batch={index} tasks={len(batch['tasks'])} "
                                           f"time={log['elapsed_s']:.1f}s tokens={log.get('total_tokens')}")
                             target = model_root / f"interactive_{run_id}_{stage}_wave{wave:03d}_batch{index:02d}.json"
-                            target.write_text(json.dumps(result["response"], ensure_ascii=False, indent=2), encoding="utf-8")
+                            ns["_write_model_text"](target, json.dumps(result["response"], ensure_ascii=False, indent=2))
                             report = self._cli("accept", "--stage", stage, "--work", work, "--response", target)
+                            accepted_count += 1
                             detail = (f"pending={report.get('pending_extraction')}" if stage == "extract"
                                       else f"round_now={report.get('round')}")
                             self.progress(f"  accept batch={index} {detail}")
@@ -303,7 +329,7 @@ class InteractiveKGSession:
                             failures.append(f"batch={index}: {exc}")
                             self.progress(f"[{label}] batch={index} 失败：{exc}")
             if failures:
-                raise RuntimeError("部分批次失败，成功结果已保存；可再次提问继续。\n" + "\n".join(failures))
+                raise RuntimeError(f"部分批次失败，本轮已接收 {accepted_count} 个成功批次；可再次提问继续。\n" + "\n".join(failures))
         raise RuntimeError(f"{label} 超过轮次上限，checkpoint 已保留")
 
     def ensure_graph(self):

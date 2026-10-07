@@ -313,6 +313,14 @@ pd.DataFrame(call_logs).to_csv(RUN_ROOT / 'call_logs.csv', index=False, encoding
 
 未安装 MarkItDown 时，可选路线的转换测试会跳过；缺失依赖的 CLI 错误测试仍会运行。安装可选依赖后可执行全部解析测试。
 
+### 模型响应与输出目录的兼容处理
+
+Skill 的 `scripts/model_io.py` 为 Notebook 与 API 问答提供同一套处理：抽取/对齐接受 JSON 字符串、`text/output_text` 文本分段或直接 JSON 对象；最终回答只使用最终文本，空响应不会被强制转成 `"None"`，reasoning/tool 块不作为答案。原始响应保留用于诊断，任务 ID、候选及指纹仍由原接收器校验。
+
+每次保存模型结果前都会确保实际父目录存在。交互入口按赋值依赖顺序应用路径覆盖：只覆盖 `RUN_ROOT` 时，`WORK_DIR`、`MODEL_OUTPUT_DIR` 和 `MANIFEST_PATH` 会随之重新计算；显式覆盖的子目录会保留，相对路径以 Notebook 所在目录为基准。失败提示报告实际已接收的成功批次数，避免 0 个结果落盘时仍声称已有成功结果。
+
+这些修改不改变核心建图脚本的签名，不要求重建现有检查点。重新打开 Notebook 后运行 Cell 1、2、5、9 初始化，再从失败阶段续跑；避免重新执行 Fresh Parse。
+
 ## 10. 常见运行问题
 
 | 现象 | 检查方法 |

@@ -16,6 +16,11 @@ try:
 except ImportError:  # pragma: no cover
     from .kg_core import _xlsx_header_row_numbers, _xlsx_headers, read_json
 
+try:
+    from model_io import model_text, write_model_text
+except ImportError:  # pragma: no cover
+    from .model_io import model_text, write_model_text
+
 LITERAL_PREDICATES = {"attribute", "observed_value", "event_time", "recorded_time"}
 STOPWORDS = {
     "为什么", "为何", "原因", "怎么", "如何", "什么", "哪些", "哪个", "是否", "请", "说明", "分析",
@@ -1226,11 +1231,18 @@ class LeanGraphRAG:
                                  headers={"Authorization": "Bearer " + key}, timeout=(30, timeout))
         response.raise_for_status()
         body = response.json()
-        answer = body.get("choices", [{}])[0].get("message", {}).get("content", "")
-        if not isinstance(answer, str) or not answer.strip():
-            raise RuntimeError("模型未返回回答正文")
+        choice = (body.get("choices") or [{}])[0]
         if debug_output:
-            Path(debug_output).write_text(json.dumps({**retrieval, "answer": answer, "usage": body.get("usage")}, ensure_ascii=False, indent=2), encoding="utf-8")
+            write_model_text(Path(debug_output).with_suffix(".response.json"),
+                             json.dumps(body, ensure_ascii=False, indent=2))
+        try:
+            answer = model_text((choice.get("message") or {}).get("content"))
+        except ValueError as exc:
+            raise RuntimeError(f"模型未返回回答正文：{exc}; finish_reason={choice.get('finish_reason')!r}") from exc
+        if choice.get("finish_reason") == "length":
+            raise RuntimeError("模型回答被截断：finish_reason=length")
+        if debug_output:
+            write_model_text(debug_output, json.dumps({**retrieval, "answer": answer, "usage": body.get("usage")}, ensure_ascii=False, indent=2))
         return answer.strip()
 
 

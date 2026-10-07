@@ -83,6 +83,19 @@ class InteractiveKGTests(unittest.TestCase):
         self.assertEqual(self.batch_calls, [])
         self.assertEqual(len(self.session.history), 2)
 
+    def test_output_directory_removed_during_model_call_is_recreated(self):
+        original = self.session.runtime['call_openrouter_batch']
+        def remove_directory(stage, *args):
+            directory = Path(self.session.runtime['MODEL_OUTPUT_DIR'])
+            if directory.exists():
+                shutil.rmtree(directory)
+            return original(stage, *args)
+
+        self.session.runtime['call_openrouter_batch'] = remove_directory
+        result = self.session.ask('ExampleProduct 的价格是多少？')
+        self.assertIn('20元', result['answer'])
+        self.assertTrue(list(Path(self.session.runtime['MODEL_OUTPUT_DIR']).glob('*.json')))
+
     def test_missing_graph_resumes_completed_checkpoint_without_model_reextraction(self):
         self.session.ask("ExampleProduct 的价格是多少？")
         before = copy.deepcopy(self.session._read_state()["extractions"])
@@ -101,7 +114,7 @@ class InteractiveKGTests(unittest.TestCase):
         def fail(*args):
             raise RuntimeError("test model failure")
         self.session.runtime["call_openrouter_batch"] = fail
-        with self.assertRaisesRegex(RuntimeError, "成功结果已保存"):
+        with self.assertRaisesRegex(RuntimeError, "本轮已接收 0 个成功批次"):
             self.session.ask("ExampleProduct 的价格是多少？")
         work = Path(self.session.runtime["WORK_DIR"])
         self.assertTrue((work / "state.json").is_file())
@@ -130,6 +143,7 @@ class InteractiveKGTests(unittest.TestCase):
             real['call_openrouter_batch']('align', {'batch_index': 0, 'tasks': [{'task_id': 'u1'}]}, 'fp', 1)
             self.assertEqual(post.call_args.kwargs['json']['max_tokens'], 3000)
             response.json.return_value = {'choices': [{'message': {'content': 'Answer'}}], 'usage': {}}
+            real['QA_MAX_TOKENS'] = 4096  # Verify the host's explicit limit, independently of the demo model config.
             real['call_final_answer']('question', {'context': 'Source context'})
             self.assertEqual(post.call_args.kwargs['json']['max_tokens'], 4096)
             self.assertEqual(post.call_args.kwargs['timeout'], (30, 300))
